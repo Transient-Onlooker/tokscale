@@ -2288,6 +2288,20 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
+    // Codex rollouts only know the caller-facing OpenCodex combo selector.
+    // When OpenCodex's durable ledger is available, correlate the existing
+    // Codex usage row with the successful physical attempt. This rewrites
+    // attribution only; it never emits an extra row, so totals cannot double
+    // count proxy traffic. Ambiguous matches keep the virtual selector.
+    if sessions::opencodex::attribute_codex_messages(
+        home_dir,
+        use_env_roots,
+        &mut all_messages,
+    ) > 0
+    {
+        apply_pricing_to_messages(&mut all_messages, pricing);
+    }
+
     // Release Codex before Copilot. This has to sit ahead of the Copilot
     // lane rather than after it: the desktop/vscode blocks below scan
     // `all_messages` for `client == "copilot"` to dedup against OTEL rows, so
