@@ -85,11 +85,7 @@ impl AttributionIndex {
             if row.provider.as_deref() != Some("combo") {
                 continue;
             }
-            if row
-                .inbound_protocol
-                .as_deref()
-                .is_some_and(|protocol| protocol != "responses")
-            {
+            if row.inbound_protocol.as_deref() != Some("responses") {
                 continue;
             }
             if !row.status.is_some_and(|status| (200..300).contains(&status)) {
@@ -602,6 +598,24 @@ mod tests {
             1
         );
         assert_eq!(messages[0].model_id, "gpt-6-luna");
+    }
+
+    #[test]
+    fn combo_rows_without_protocol_are_ignored() {
+        let home = TempDir::new().unwrap();
+        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("inboundProtocol");
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
     }
 
     #[test]
