@@ -60,6 +60,12 @@ struct IndexedRow {
     attempts: Vec<PersistedAttempt>,
 }
 
+/// One possible ledger row; an unknown target still claims that row.
+struct CandidateMatch {
+    row_index: usize,
+    target: Option<PhysicalTarget>,
+}
+
 #[derive(Debug, Default)]
 struct AttributionIndex {
     by_selector: HashMap<String, Vec<IndexedRow>>,
@@ -117,29 +123,46 @@ impl AttributionIndex {
                 });
         }
 
+        for rows in index.by_selector.values_mut() {
+            rows.sort_unstable_by_key(|row| row.timestamp);
+        }
         Some(index)
     }
 
-    fn resolve(&self, message: &UnifiedMessage) -> Option<PhysicalTarget> {
-        let rows = self.by_selector.get(&message.model_id)?;
-        let mut targets = HashSet::new();
+    /// Inspect only the selector's bounded time window. Candidates with
+    /// unknown or conflicting physical targets still reserve their ledger row.
+    fn candidates(&self, message: &UnifiedMessage) -> Vec<CandidateMatch> {
+        if message.timestamp <= 0 {
+            return Vec::new();
+        }
+        let Some(rows) = self.by_selector.get(&message.model_id) else {
+            return Vec::new();
+        };
+        let skew = if message.duration_ms.is_some_and(|duration| duration >= 0) {
+            MAX_START_SKEW_MS as i64
+        } else {
+            MAX_END_SKEW_MS as i64
+        };
+        let first = rows.partition_point(|row| {
+            row.timestamp < message.timestamp.saturating_sub(skew)
+        });
+        let end = rows.partition_point(|row| {
+            row.timestamp <= message.timestamp.saturating_add(skew)
+        });
+        let mut candidates = Vec::new();
 
-        for row in rows {
+        for (offset, row) in rows[first..end].iter().enumerate() {
             if !timing_matches(message, row) {
                 continue;
             }
-
+            let mut targets = HashSet::new();
+            let mut matched = false;
+            let mut missing_identity = false;
             for attempt in &row.attempts {
                 if !attempt
                     .status
                     .is_some_and(|status| (200..300).contains(&status))
-                {
-                    continue;
-                }
-                if attempt
-                    .usage_status
-                    .as_deref()
-                    .is_some_and(|status| status != "reported")
+                    || attempt.usage_status.as_deref() != Some("reported")
                 {
                     continue;
                 }
@@ -149,28 +172,33 @@ impl AttributionIndex {
                 if !usage_matches(message, usage) {
                     continue;
                 }
-                let (Some(provider), Some(model)) =
-                    (attempt.provider.as_ref(), attempt.model.as_ref())
-                else {
-                    continue;
-                };
-                if provider.is_empty() || model.is_empty() {
-                    continue;
+                matched = true;
+                match (attempt.provider.as_deref(), attempt.model.as_deref()) {
+                    (Some(provider), Some(model))
+                        if !provider.is_empty() && !model.is_empty() =>
+                    {
+                        targets.insert(PhysicalTarget {
+                            provider: provider.to_string(),
+                            model: model.to_string(),
+                        });
+                    }
+                    _ => missing_identity = true,
                 }
-
-                targets.insert(PhysicalTarget {
-                    provider: provider.clone(),
-                    model: model.clone(),
+            }
+            if matched {
+                candidates.push(CandidateMatch {
+                    row_index: first + offset,
+                    target: if !missing_identity && targets.len() == 1 {
+                        targets.into_iter().next()
+                    } else {
+                        None
+                    },
                 });
             }
         }
-
-        if targets.len() == 1 {
-            targets.into_iter().next()
-        } else {
-            None
-        }
+        candidates
     }
+
 }
 
 fn timing_matches(message: &UnifiedMessage, row: &IndexedRow) -> bool {
@@ -306,8 +334,8 @@ fn usage_log_path(home_dir: &str, use_env_roots: bool) -> PathBuf {
 /// Matching deliberately fails closed. A row must be a successful Responses
 /// combo request, the requested selector must match exactly, a successful
 /// reported attempt must match Codex's token signature, and request timing
-/// must line up. If more than one physical target survives those checks, the
-/// original selector is retained.
+/// must line up. Each ledger row may serve at most one Codex usage row.
+/// Ambiguity retains the original selector.
 pub(crate) fn attribute_codex_messages(
     home_dir: &str,
     use_env_roots: bool,
@@ -322,23 +350,47 @@ pub(crate) fn attribute_codex_messages(
         return 0;
     };
 
+    // Collect every feasible ledger claim before changing any model IDs.
+    // Even a message with multiple candidates prevents another message from
+    // claiming its shared row: uncertain attribution must fail closed.
+    let candidates: Vec<Vec<CandidateMatch>> = messages
+        .iter()
+        .map(|message| {
+            if message.client == "codex" {
+                index.candidates(message)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let mut claims: HashMap<(String, usize), usize> = HashMap::new();
+    for (message, matches) in messages.iter().zip(&candidates) {
+        for candidate in matches {
+            *claims
+                .entry((message.model_id.clone(), candidate.row_index))
+                .or_default() += 1;
+        }
+    }
+
     let mut attributed = 0;
-    for message in messages
-        .iter_mut()
-        .filter(|message| message.client == "codex")
-    {
-        let Some(target) = index.resolve(message) else {
+    for (message, matches) in messages.iter_mut().zip(candidates) {
+        if message.client != "codex" || matches.len() != 1 {
+            continue;
+        }
+        let candidate = matches.into_iter().next().unwrap();
+        if claims.get(&(message.model_id.clone(), candidate.row_index)) != Some(&1) {
+            continue;
+        }
+        let Some(target) = candidate.target else {
             continue;
         };
-
         if message.provider_id == target.provider && message.model_id == target.model {
             continue;
         }
 
         message.provider_id = target.provider;
         message.model_id = target.model;
-        // Any estimate computed for the virtual selector is invalid after
-        // attribution. The caller reprices this physical identity.
+        // Estimates for the virtual selector cannot price the physical model.
         message.cost = 0.0;
         message.cost_source = CostSource::Unknown;
         attributed += 1;
@@ -624,6 +676,105 @@ mod tests {
             0
         );
         assert_eq!(messages[0].model_id, SELECTOR);
+    }
+
+    #[test]
+    fn missing_attempt_usage_status_fails_closed() {
+        let home = TempDir::new().unwrap();
+        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
+        value["attempts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("usageStatus");
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
+    }
+
+    #[test]
+    fn a_single_ledger_row_cannot_attribute_two_messages() {
+        let home = TempDir::new().unwrap();
+        write_ledger(
+            home.path(),
+            &[row("gpt-6-luna", 200, 200, Some(usage()))],
+            false,
+        );
+        let mut messages = vec![codex_message(), codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert!(messages.iter().all(|msg| msg.model_id == SELECTOR));
+    }
+
+    #[test]
+    fn duplicate_ledger_rows_fail_closed() {
+        let home = TempDir::new().unwrap();
+        let entry = row("gpt-6-luna", 200, 200, Some(usage()));
+        write_ledger(home.path(), &[entry.clone(), entry], false);
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+    }
+
+    #[test]
+    fn distant_requests_claim_their_own_rows_after_sorting() {
+        let home = TempDir::new().unwrap();
+        let first = row("gpt-6-luna", 200, 200, Some(usage()));
+        let mut later = row("gpt-6.1-sol", 200, 200, Some(usage()));
+        later["timestamp"] = json!(START + 312_952);
+        let mut messages = vec![codex_message(), codex_message()];
+        messages[1].timestamp += 300_000;
+        write_ledger(home.path(), &[later, first], false);
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            2
+        );
+        assert_eq!(messages[0].model_id, "gpt-6-luna");
+        assert_eq!(messages[1].model_id, "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn appended_rows_invalidate_cached_index_and_restore_ambiguity() {
+        let home = TempDir::new().unwrap();
+        let item = row("gpt-6-luna", 200, 200, Some(usage()));
+        write_ledger(home.path(), &[item.clone()], false);
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+        write_ledger(home.path(), &[item.clone(), item], false);
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+    }
+
+    #[test]
+    fn sorted_time_window_skips_unrelated_history() {
+        let home = TempDir::new().unwrap();
+        let mut rows = Vec::new();
+        for i in (1..=1000_i64).rev() {
+            let mut far = row("gpt-6.1-sol", 200, 200, Some(usage()));
+            far["timestamp"] = json!(START + i * 300_000);
+            rows.push(far);
+        }
+        rows.push(row("gpt-6-luna", 200, 200, Some(usage())));
+        write_ledger(home.path(), &rows, false);
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+        assert_eq!(messages[0].model_id, "gpt-6-luna");
     }
 
     #[test]

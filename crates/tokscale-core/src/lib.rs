@@ -17071,6 +17071,130 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn opencodex_overlay_preserves_cold_warm_codex_cache_and_json_aggregation() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let home = source_home.path();
+        write_codex_twin_token_count_fixture(home);
+        let rollout = home.join(".codex/sessions/twin-deltas.jsonl");
+        let transcript = std::fs::read_to_string(&rollout).unwrap();
+        std::fs::write(
+            &rollout,
+            transcript
+                .replace("gpt-5.2", "sol-luna-jev-combo")
+                .replace("2026-04-30T11:00:03Z", "2026-04-30T11:00:10Z"),
+        )
+        .unwrap();
+
+        let pricing = pricing::PricingService::new(
+            HashMap::from([
+                (
+                    "sol-luna-jev-combo".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.01),
+                        output_cost_per_token: Some(0.01),
+                        cache_read_input_token_cost: Some(0.01),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "gpt-6-luna".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.001),
+                        output_cost_per_token: Some(0.001),
+                        cache_read_input_token_cost: Some(0.001),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            HashMap::new(),
+        );
+        let home_str = home.to_str().unwrap();
+        let clients = ["codex".to_string()];
+        let original = parse_all_messages_with_pricing(home_str, &clients, Some(&pricing));
+        assert_eq!(original.len(), 2);
+        assert!(original.iter().all(|msg| msg.model_id == "sol-luna-jev-combo"));
+        let selected = original.iter().min_by_key(|msg| msg.timestamp).unwrap();
+        assert!(selected.cost > 0.0);
+        assert!(
+            message_cache::SourceMessageCache::load()
+                .get(message_cache::CacheIdentity::for_client(ClientId::Codex), &rollout)
+                .is_some(),
+            "the original Codex rollout should be cached before attribution"
+        );
+        let original_tokens: i64 = original.iter().map(|msg| msg.tokens.total()).sum();
+        let raw_input = selected.tokens.input + selected.tokens.cache_read;
+        let raw_output = selected.tokens.output + selected.tokens.reasoning;
+        let ledger = serde_json::json!({
+            "provider": "combo",
+            "model": "sol-luna-jev-combo",
+            "requestedModel": "sol-luna-jev-combo",
+            "inboundProtocol": "responses",
+            "timestamp": selected.timestamp,
+            "durationMs": selected.duration_ms.unwrap_or(0),
+            "status": 200,
+            "attempts": [{
+                "provider": "openai",
+                "model": "gpt-6-luna",
+                "status": 200,
+                "usageStatus": "reported",
+                "usage": {
+                    "inputTokens": raw_input,
+                    "outputTokens": raw_output,
+                    "totalTokens": raw_input + raw_output,
+                    "cachedInputTokens": selected.tokens.cache_read,
+                    "reasoningOutputTokens": selected.tokens.reasoning
+                }
+            }]
+        });
+        let ledger_dir = home.join(".opencodex");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        std::fs::write(ledger_dir.join("usage.jsonl"), format!("{ledger}\n")).unwrap();
+
+        for _ in 0..2 {
+            let actual = parse_all_messages_with_pricing(home_str, &clients, Some(&pricing));
+            assert_eq!(actual.len(), 2);
+            assert_eq!(
+                actual.iter().map(|msg| msg.tokens.total()).sum::<i64>(),
+                original_tokens
+            );
+            let physical: Vec<_> = actual
+                .iter()
+                .filter(|msg| msg.model_id == "gpt-6-luna")
+                .collect();
+            assert_eq!(physical.len(), 1);
+            assert_eq!(physical[0].provider_id, "openai");
+            assert!(physical[0].cost > 0.0);
+            assert!(physical[0].cost < selected.cost);
+            assert_eq!(physical[0].cost_source, sessions::CostSource::Estimated);
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|msg| msg.model_id == "sol-luna-jev-combo")
+                    .count(),
+                1
+            );
+
+            let groups = aggregate_model_usage_entries(actual, &GroupBy::ClientProviderModel);
+            assert_eq!(groups.len(), 2);
+            let json = serde_json::to_value(&groups).unwrap();
+            let entries = json.as_array().unwrap();
+            assert!(entries.iter().any(|row| row["model"] == "gpt-6-luna"));
+            assert!(entries.iter().any(|row| row["model"] == "sol-luna-jev-combo"));
+            let grouped_tokens: i64 = groups
+                .iter()
+                .map(|group| {
+                    group.input + group.output + group.cache_read
+                        + group.cache_write + group.reasoning
+                })
+                .sum();
+            assert_eq!(grouped_tokens, original_tokens);
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_parse_local_clients_codex_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
