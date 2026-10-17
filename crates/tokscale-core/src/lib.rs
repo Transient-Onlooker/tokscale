@@ -11489,7 +11489,7 @@ mod tests {
         };
         let mut message = UnifiedMessage::new(
             "codex",
-            "sol-luna-jev-combo",
+            "combo/aggregate-fixture",
             "synthetic",
             "session",
             1,
@@ -11501,7 +11501,7 @@ mod tests {
 
         // A physical target can have different gateway identity, but the
         // client filter must retain the selected source Codex row.
-        message.model_id = "gpt-6-luna".to_string();
+        message.model_id = "served-model-fixture".to_string();
         message.provider_id = "openai".to_string();
         assert!(!matches_flush_filter(&message, &context));
 
@@ -11510,7 +11510,7 @@ mod tests {
         flush_retained_lane(&mut buffer, &context, &mut sink);
 
         assert_eq!(sink.len(), 1);
-        assert_eq!(sink[0].model_id, "gpt-6-luna");
+        assert_eq!(sink[0].model_id, "served-model-fixture");
         assert_eq!(sink[0].provider_id, "openai");
     }
 
@@ -17083,7 +17083,7 @@ mod tests {
         std::fs::write(
             &rollout,
             transcript
-                .replace("gpt-5.2", "sol-luna-jev-combo")
+                .replace("gpt-5.2", "combo/aggregate-fixture")
                 .replace("2026-04-30T11:00:03Z", "2026-04-30T11:00:10Z"),
         )
         .unwrap();
@@ -17091,7 +17091,7 @@ mod tests {
         let pricing = pricing::PricingService::new(
             HashMap::from([
                 (
-                    "sol-luna-jev-combo".to_string(),
+                    "combo/aggregate-fixture".to_string(),
                     pricing::ModelPricing {
                         input_cost_per_token: Some(0.01),
                         output_cost_per_token: Some(0.01),
@@ -17100,7 +17100,7 @@ mod tests {
                     },
                 ),
                 (
-                    "gpt-6-luna".to_string(),
+                    "served-model-fixture".to_string(),
                     pricing::ModelPricing {
                         input_cost_per_token: Some(0.001),
                         output_cost_per_token: Some(0.001),
@@ -17115,12 +17115,17 @@ mod tests {
         let clients = ["codex".to_string()];
         let original = parse_all_messages_with_pricing(home_str, &clients, Some(&pricing));
         assert_eq!(original.len(), 2);
-        assert!(original.iter().all(|msg| msg.model_id == "sol-luna-jev-combo"));
+        assert!(original
+            .iter()
+            .all(|msg| msg.model_id == "combo/aggregate-fixture"));
         let selected = original.iter().min_by_key(|msg| msg.timestamp).unwrap();
         assert!(selected.cost > 0.0);
         assert!(
             message_cache::SourceMessageCache::load()
-                .get(message_cache::CacheIdentity::for_client(ClientId::Codex), &rollout)
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &rollout
+                )
                 .is_some(),
             "the original Codex rollout should be cached before attribution"
         );
@@ -17129,16 +17134,22 @@ mod tests {
         let raw_output = selected.tokens.output + selected.tokens.reasoning;
         let ledger = serde_json::json!({
             "provider": "combo",
-            "model": "sol-luna-jev-combo",
-            "requestedModel": "sol-luna-jev-combo",
+            "model": "combo/aggregate-fixture",
+            "requestedModel": "combo/aggregate-fixture",
+            "servedModel": "served-model-fixture",
             "inboundProtocol": "responses",
             "timestamp": selected.timestamp,
             "durationMs": selected.duration_ms.unwrap_or(0),
             "status": 200,
             "attempts": [{
+                "ordinal": 1,
                 "provider": "openai",
-                "model": "gpt-6-luna",
+                "model": "wire-model-fixture",
+                "adapter": "fixture-responses",
                 "status": 200,
+                "durationMs": selected.duration_ms.unwrap_or(0),
+                "sendCount": 1,
+                "recoveryKinds": [],
                 "usageStatus": "reported",
                 "usage": {
                     "inputTokens": raw_input,
@@ -17162,7 +17173,7 @@ mod tests {
             );
             let physical: Vec<_> = actual
                 .iter()
-                .filter(|msg| msg.model_id == "gpt-6-luna")
+                .filter(|msg| msg.model_id == "served-model-fixture")
                 .collect();
             assert_eq!(physical.len(), 1);
             assert_eq!(physical[0].provider_id, "openai");
@@ -17172,7 +17183,7 @@ mod tests {
             assert_eq!(
                 actual
                     .iter()
-                    .filter(|msg| msg.model_id == "sol-luna-jev-combo")
+                    .filter(|msg| msg.model_id == "combo/aggregate-fixture")
                     .count(),
                 1
             );
@@ -17181,13 +17192,20 @@ mod tests {
             assert_eq!(groups.len(), 2);
             let json = serde_json::to_value(&groups).unwrap();
             let entries = json.as_array().unwrap();
-            assert!(entries.iter().any(|row| row["model"] == "gpt-6-luna"));
-            assert!(entries.iter().any(|row| row["model"] == "sol-luna-jev-combo"));
+            assert!(entries
+                .iter()
+                .any(|row| row["model"] == "served-model-fixture"));
+            assert!(entries
+                .iter()
+                .any(|row| row["model"] == "combo/aggregate-fixture"));
             let grouped_tokens: i64 = groups
                 .iter()
                 .map(|group| {
-                    group.input + group.output + group.cache_read
-                        + group.cache_write + group.reasoning
+                    group.input
+                        + group.output
+                        + group.cache_read
+                        + group.cache_write
+                        + group.reasoning
                 })
                 .sum();
             assert_eq!(grouped_tokens, original_tokens);

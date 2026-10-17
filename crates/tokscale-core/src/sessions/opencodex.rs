@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -12,11 +12,19 @@ use super::{CostSource, UnifiedMessage};
 
 const MAX_END_SKEW_MS: u64 = 2_000;
 const MAX_START_SKEW_MS: u64 = 120_000;
+/// Bounds how far a response's recorded end can sit after its start while a
+/// start-less Codex record is still correlated through its end anchor. Longer
+/// responses keep the virtual selector (fail closed) instead of widening the
+/// scan without limit.
+const MAX_RESPONSE_DURATION_MS: i64 = 600_000;
+/// One hand-edited or truncated ledger line must not allocate without bound.
+const MAX_LEDGER_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PhysicalTarget {
     provider: String,
     model: String,
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -28,16 +36,31 @@ struct PersistedUsage {
     cached_input_tokens: Option<i64>,
     cache_read_input_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
+    estimated: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedTierOutcome {
+    response_service_tier: Option<String>,
+    response_tier_authoritative: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedAttempt {
+    ordinal: Option<i64>,
     provider: Option<String>,
     model: Option<String>,
+    adapter: Option<String>,
     status: Option<i32>,
+    duration_ms: Option<i64>,
+    send_count: Option<i64>,
     usage_status: Option<String>,
     usage: Option<PersistedUsage>,
+    stream_aborted: Option<bool>,
+    locally_answered: Option<bool>,
+    tier_outcome: Option<PersistedTierOutcome>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -45,8 +68,8 @@ struct PersistedAttempt {
 struct PersistedUsageRow {
     timestamp: Option<i64>,
     provider: Option<String>,
-    model: Option<String>,
     requested_model: Option<String>,
+    served_model: Option<String>,
     inbound_protocol: Option<String>,
     status: Option<i32>,
     duration_ms: Option<i64>,
@@ -57,6 +80,10 @@ struct PersistedUsageRow {
 struct IndexedRow {
     timestamp: i64,
     duration_ms: i64,
+    /// Resolved once at load: the observed upstream identity behind the row's
+    /// single successful reported attempt. `None` still claims the row so an
+    /// unclear request blocks attribution instead of yielding to another.
+    target: Option<PhysicalTarget>,
     attempts: Vec<PersistedAttempt>,
 }
 
@@ -64,6 +91,63 @@ struct IndexedRow {
 struct CandidateMatch {
     row_index: usize,
     target: Option<PhysicalTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+/// Read and consume one JSONL row without allocating beyond the row cap. An
+/// oversized row is discarded through its newline and parsing continues.
+fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> io::Result<BoundedLine> {
+    line.clear();
+    let mut consumed = 0usize;
+    let mut oversized = false;
+
+    loop {
+        let (take, has_newline) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if consumed == 0 {
+                    BoundedLine::Eof
+                } else if oversized {
+                    BoundedLine::Oversized
+                } else {
+                    BoundedLine::Line
+                });
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if !oversized {
+                if line.len().saturating_add(take) > MAX_LEDGER_LINE_BYTES {
+                    oversized = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(&available[..take]);
+                }
+            }
+            (take, available[take - 1] == b'\n')
+        };
+        reader.consume(take);
+        consumed = consumed.saturating_add(take);
+        if has_newline {
+            if !oversized {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                }
+                return Ok(BoundedLine::Line);
+            }
+            return Ok(BoundedLine::Oversized);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -74,52 +158,58 @@ struct AttributionIndex {
 impl AttributionIndex {
     fn load(path: &Path) -> Option<Self> {
         let file = File::open(path).ok()?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
         let mut index = Self::default();
 
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                continue;
-            };
-            if line.trim().is_empty() {
+        loop {
+            match read_bounded_line(&mut reader, &mut line).ok()? {
+                BoundedLine::Eof => break,
+                BoundedLine::Oversized => continue,
+                BoundedLine::Line => {}
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
 
-            let Ok(row) = serde_json::from_str::<PersistedUsageRow>(&line) else {
+            let Ok(row) = serde_json::from_slice::<PersistedUsageRow>(&line) else {
                 continue;
             };
-            if row.provider.as_deref() != Some("combo") {
-                continue;
-            }
-            if row.inbound_protocol.as_deref() != Some("responses") {
-                continue;
-            }
-            if !row
-                .status
-                .is_some_and(|status| (200..300).contains(&status))
+            if row.provider.as_deref() != Some("combo")
+                || row.inbound_protocol.as_deref() != Some("responses")
+                || !row
+                    .status
+                    .is_some_and(|status| (200..300).contains(&status))
             {
                 continue;
             }
 
-            let Some(selector) = row.requested_model.as_deref().or(row.model.as_deref()) else {
+            // The selector is required evidence: a row that cannot name what
+            // Codex asked for cannot correlate anything and is not a claim.
+            let Some(selector) = row
+                .requested_model
+                .as_deref()
+                .filter(|selector| !selector.is_empty())
+            else {
                 continue;
             };
             let Some(timestamp) = row.timestamp.filter(|timestamp| *timestamp > 0) else {
                 continue;
             };
-            let attempts = row.attempts.unwrap_or_default();
-            if attempts.is_empty() {
+            let Some(duration_ms) = row.duration_ms.filter(|duration| *duration >= 0) else {
                 continue;
-            }
+            };
 
+            let target = resolve_row_target(&row);
             index
                 .by_selector
                 .entry(selector.to_string())
                 .or_default()
                 .push(IndexedRow {
                     timestamp,
-                    duration_ms: row.duration_ms.unwrap_or(0).max(0),
-                    attempts,
+                    duration_ms,
+                    target,
+                    attempts: row.attempts.unwrap_or_default(),
                 });
         }
 
@@ -138,16 +228,26 @@ impl AttributionIndex {
         let Some(rows) = self.by_selector.get(&message.model_id) else {
             return Vec::new();
         };
-        let skew = if message.duration_ms.is_some_and(|duration| duration >= 0) {
+        // The ledger row is stamped at its request start, which sits within
+        // the start skew of a timed message and anywhere inside the response
+        // span of a start-less record. End anchors bound both windows.
+        let span = message
+            .duration_ms
+            .filter(|duration| *duration >= 0)
+            .unwrap_or(MAX_RESPONSE_DURATION_MS);
+        let back = if message.duration_ms.is_some_and(|duration| duration >= 0) {
             MAX_START_SKEW_MS as i64
         } else {
-            MAX_END_SKEW_MS as i64
+            MAX_END_SKEW_MS as i64 + MAX_RESPONSE_DURATION_MS
         };
-        let first = rows.partition_point(|row| {
-            row.timestamp < message.timestamp.saturating_sub(skew)
-        });
+        let first =
+            rows.partition_point(|row| row.timestamp < message.timestamp.saturating_sub(back));
         let end = rows.partition_point(|row| {
-            row.timestamp <= message.timestamp.saturating_add(skew)
+            row.timestamp
+                <= message
+                    .timestamp
+                    .saturating_add(span)
+                    .saturating_add(MAX_END_SKEW_MS as i64)
         });
         let mut candidates = Vec::new();
 
@@ -155,50 +255,88 @@ impl AttributionIndex {
             if !timing_matches(message, row) {
                 continue;
             }
-            let mut targets = HashSet::new();
-            let mut matched = false;
-            let mut missing_identity = false;
-            for attempt in &row.attempts {
-                if !attempt
-                    .status
-                    .is_some_and(|status| (200..300).contains(&status))
-                    || attempt.usage_status.as_deref() != Some("reported")
-                {
-                    continue;
-                }
-                let Some(usage) = attempt.usage.as_ref() else {
-                    continue;
-                };
-                if !usage_matches(message, usage) {
-                    continue;
-                }
-                matched = true;
-                match (attempt.provider.as_deref(), attempt.model.as_deref()) {
-                    (Some(provider), Some(model))
-                        if !provider.is_empty() && !model.is_empty() =>
-                    {
-                        targets.insert(PhysicalTarget {
-                            provider: provider.to_string(),
-                            model: model.to_string(),
-                        });
-                    }
-                    _ => missing_identity = true,
-                }
-            }
+            let matched = row.attempts.iter().any(|attempt| {
+                attempt_eligible(attempt)
+                    && attempt
+                        .usage
+                        .as_ref()
+                        .is_some_and(|usage| usage_matches(message, usage))
+            });
             if matched {
                 candidates.push(CandidateMatch {
                     row_index: first + offset,
-                    target: if !missing_identity && targets.len() == 1 {
-                        targets.into_iter().next()
-                    } else {
-                        None
-                    },
+                    target: row.target.clone(),
                 });
             }
         }
         candidates
     }
+}
 
+/// One reported success per row, fully validated against the upstream attempt
+/// contract. The observed `servedModel` — not the wire model a route intended
+/// to send — is the only accepted physical identity, and only when exactly one
+/// successful reported attempt can claim it. Anything else leaves the row
+/// reserved with no target.
+fn resolve_row_target(row: &PersistedUsageRow) -> Option<PhysicalTarget> {
+    let served_model = row
+        .served_model
+        .as_deref()
+        .filter(|model| !model.is_empty())?;
+    let eligible: Vec<&PersistedAttempt> = row
+        .attempts
+        .as_ref()?
+        .iter()
+        .filter(|attempt| attempt_eligible(attempt))
+        .collect();
+    if eligible.len() != 1 {
+        return None;
+    }
+    let attempt = eligible[0];
+    let provider = attempt.provider.as_deref()?;
+    let service_tier = attempt
+        .tier_outcome
+        .as_ref()
+        .filter(|tier| tier.response_tier_authoritative == Some(true))
+        .and_then(|tier| tier.response_service_tier.as_deref())
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_string);
+    Some(PhysicalTarget {
+        provider: provider.to_string(),
+        model: served_model.to_string(),
+        service_tier,
+    })
+}
+
+/// A 2xx reported attempt whose required bookkeeping is intact. Estimates are
+/// not observations, and a locally answered or stream-aborted attempt is not
+/// the response Codex received.
+fn attempt_eligible(attempt: &PersistedAttempt) -> bool {
+    attempt.ordinal.is_some_and(|ordinal| ordinal > 0)
+        && attempt
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.is_empty())
+        && attempt
+            .model
+            .as_deref()
+            .is_some_and(|model| !model.is_empty())
+        && attempt
+            .adapter
+            .as_deref()
+            .is_some_and(|adapter| !adapter.is_empty())
+        && attempt
+            .status
+            .is_some_and(|status| (200..300).contains(&status))
+        && attempt.duration_ms.is_some_and(|duration| duration >= 0)
+        && attempt.send_count.is_some_and(|sends| sends >= 0)
+        && attempt.usage_status.as_deref() == Some("reported")
+        && attempt.stream_aborted != Some(true)
+        && attempt.locally_answered != Some(true)
+        && attempt
+            .usage
+            .as_ref()
+            .is_some_and(|usage| usage.estimated != Some(true))
 }
 
 fn timing_matches(message: &UnifiedMessage, row: &IndexedRow) -> bool {
@@ -206,16 +344,17 @@ fn timing_matches(message: &UnifiedMessage, row: &IndexedRow) -> bool {
         return false;
     }
 
-    let start_skew = message.timestamp.abs_diff(row.timestamp);
+    let row_end = row.timestamp.saturating_add(row.duration_ms);
     if let Some(duration_ms) = message.duration_ms.filter(|duration| *duration >= 0) {
-        if start_skew > MAX_START_SKEW_MS {
+        if message.timestamp.abs_diff(row.timestamp) > MAX_START_SKEW_MS {
             return false;
         }
         let message_end = message.timestamp.saturating_add(duration_ms);
-        let row_end = row.timestamp.saturating_add(row.duration_ms);
         message_end.abs_diff(row_end) <= MAX_END_SKEW_MS
     } else {
-        start_skew <= MAX_END_SKEW_MS
+        // An unconfirmed `token_usage_record` is timestamped when the response
+        // lands, so its time anchors on the request's end, not its start.
+        message.timestamp.abs_diff(row_end) <= MAX_END_SKEW_MS
     }
 }
 
@@ -239,8 +378,15 @@ fn usage_matches(message: &UnifiedMessage, usage: &PersistedUsage) -> bool {
         }
     }
 
-    let cached = usage.cached_input_tokens.max(usage.cache_read_input_tokens);
-    if cached.is_some_and(|cached| cached != message.tokens.cache_read) {
+    // Both spellings of the cache counter are observations; disagreeing
+    // counters mean malformed evidence, not a choice between them.
+    if usage
+        .cached_input_tokens
+        .is_some_and(|cached| cached != message.tokens.cache_read)
+        || usage
+            .cache_read_input_tokens
+            .is_some_and(|cached| cached != message.tokens.cache_read)
+    {
         return false;
     }
 
@@ -384,12 +530,22 @@ pub(crate) fn attribute_codex_messages(
         let Some(target) = candidate.target else {
             continue;
         };
-        if message.provider_id == target.provider && message.model_id == target.model {
+        let tier_changed = target
+            .service_tier
+            .as_ref()
+            .is_some_and(|tier| message.service_tier.as_ref() != Some(tier));
+        if message.provider_id == target.provider
+            && message.model_id == target.model
+            && !tier_changed
+        {
             continue;
         }
 
         message.provider_id = target.provider;
         message.model_id = target.model;
+        if let Some(service_tier) = target.service_tier {
+            message.service_tier = Some(service_tier);
+        }
         // Estimates for the virtual selector cannot price the physical model.
         message.cost = 0.0;
         message.cost_source = CostSource::Unknown;
@@ -408,24 +564,30 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const SELECTOR: &str = "sol-luna-jev-combo";
-    const START: i64 = 1_791_132_925_632;
-    const DURATION: i64 = 21_597;
+    const SELECTOR: &str = "combo/test-fixture";
+    const START: i64 = 1_700_000_000_000;
+    const DURATION: i64 = 10_000;
+    const ROW_START_OFFSET: i64 = 4_000;
+    const ROW_DURATION: i64 = 6_000;
+    const WIRE_MODEL: &str = "wire-model-fixture";
+    const SERVED_MODEL: &str = "served-model-fixture";
+    const OTHER_SERVED_MODEL: &str = "other-served-model-fixture";
+    const PROVIDER: &str = "fixture-provider";
 
     fn codex_message() -> UnifiedMessage {
         let mut message = UnifiedMessage::new(
             "codex",
             SELECTOR,
             "openai",
-            "session",
+            "fixture-session",
             START,
             TokenBreakdown {
-                input: 1_147,
-                output: 181,
-                cache_read: 95_488,
+                input: 100,
+                output: 20,
+                cache_read: 400,
                 cache_write: 0,
                 cache_write_1h: 0,
-                reasoning: 134,
+                reasoning: 5,
             },
             7.0,
         );
@@ -436,38 +598,49 @@ mod tests {
 
     fn usage() -> Value {
         json!({
-            "inputTokens": 96635,
-            "outputTokens": 315,
-            "totalTokens": 96950,
-            "cachedInputTokens": 95488,
-            "reasoningOutputTokens": 134
+            "inputTokens": 500,
+            "outputTokens": 25,
+            "totalTokens": 525,
+            "cachedInputTokens": 400,
+            "cacheReadInputTokens": 400,
+            "reasoningOutputTokens": 5
         })
     }
 
-    fn row(target: &str, status: i32, attempt_status: i32, usage_value: Option<Value>) -> Value {
+    fn row_with_served(
+        served: &str,
+        status: i32,
+        attempt_status: i32,
+        usage_value: Option<Value>,
+    ) -> Value {
         json!({
-            "requestId": "ocx-test",
-            "timestamp": START + 12_952,
+            "requestId": "fixture-request",
+            "timestamp": START + ROW_START_OFFSET,
             "provider": "combo",
             "model": SELECTOR,
             "requestedModel": SELECTOR,
+            "servedModel": served,
             "inboundProtocol": "responses",
             "status": status,
-            "durationMs": 8_595,
+            "durationMs": ROW_DURATION,
             "usageStatus": if usage_value.is_some() { "reported" } else { "unreported" },
             "attempts": [{
                 "ordinal": 1,
-                "provider": "openai",
-                "model": target,
-                "adapter": "openai-responses",
+                "provider": PROVIDER,
+                "model": WIRE_MODEL,
+                "adapter": "fixture-responses",
                 "status": attempt_status,
-                "durationMs": 8_595,
+                "durationMs": ROW_DURATION,
                 "sendCount": 1,
                 "recoveryKinds": [],
                 "usageStatus": if usage_value.is_some() { "reported" } else { "unreported" },
                 "usage": usage_value
             }]
         })
+    }
+
+    fn row(status: i32, attempt_status: i32, usage_value: Option<Value>) -> Value {
+        row_with_served(SERVED_MODEL, status, attempt_status, usage_value)
     }
 
     fn write_ledger(home: &Path, rows: &[Value], malformed_prefix: bool) {
@@ -485,46 +658,46 @@ mod tests {
     }
 
     #[test]
-    fn attributes_matching_combo_attempt_and_clears_virtual_cost() {
+    fn attributes_unique_reported_attempt_to_observed_served_model() {
         let home = TempDir::new().unwrap();
-        write_ledger(
-            home.path(),
-            &[row("gpt-6-luna", 200, 200, Some(usage()))],
-            false,
-        );
+        write_ledger(home.path(), &[row(200, 200, Some(usage()))], false);
         let mut messages = vec![codex_message()];
 
         assert_eq!(
             attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
             1
         );
-        assert_eq!(messages[0].provider_id, "openai");
-        assert_eq!(messages[0].model_id, "gpt-6-luna");
+        assert_eq!(messages[0].provider_id, PROVIDER);
+        assert_eq!(messages[0].model_id, SERVED_MODEL);
+        assert_ne!(messages[0].model_id, WIRE_MODEL);
         assert_eq!(messages[0].cost, 0.0);
         assert_eq!(messages[0].cost_source, CostSource::Unknown);
     }
 
     #[test]
-    fn malformed_lines_are_skipped_without_hiding_valid_rows() {
+    fn malformed_and_oversized_lines_do_not_hide_a_valid_row() {
         let home = TempDir::new().unwrap();
-        write_ledger(
-            home.path(),
-            &[row("gpt-6.1-sol", 200, 200, Some(usage()))],
-            true,
-        );
+        let dir = home.path().join(".opencodex");
+        fs::create_dir_all(&dir).unwrap();
+        let mut body = b"{ definitely-not-json }\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_LEDGER_LINE_BYTES + 1));
+        body.push(b'\n');
+        body.extend(serde_json::to_vec(&row(200, 200, Some(usage()))).unwrap());
+        body.push(b'\n');
+        fs::write(dir.join("usage.jsonl"), body).unwrap();
         let mut messages = vec![codex_message()];
 
         assert_eq!(
             attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
             1
         );
-        assert_eq!(messages[0].model_id, "gpt-6.1-sol");
+        assert_eq!(messages[0].model_id, SERVED_MODEL);
     }
 
     #[test]
     fn cancelled_or_unreported_attempt_is_not_used() {
         let home = TempDir::new().unwrap();
-        write_ledger(home.path(), &[row("gpt-6-luna", 499, 499, None)], false);
+        write_ledger(home.path(), &[row(499, 499, None)], false);
         let mut messages = vec![codex_message()];
 
         assert_eq!(
@@ -535,16 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_physical_targets_fail_closed() {
+    fn missing_usage_status_fails_closed() {
         let home = TempDir::new().unwrap();
-        write_ledger(
-            home.path(),
-            &[
-                row("gpt-6-luna", 200, 200, Some(usage())),
-                row("gpt-6.1-sol", 200, 200, Some(usage())),
-            ],
-            false,
-        );
+        let mut value = row(200, 200, Some(usage()));
+        value["attempts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("usageStatus");
+        write_ledger(home.path(), &[value], false);
         let mut messages = vec![codex_message()];
 
         assert_eq!(
@@ -555,15 +726,110 @@ mod tests {
     }
 
     #[test]
-    fn failed_failover_attempt_does_not_override_successful_attempt() {
+    fn missing_observed_served_model_fails_closed() {
         let home = TempDir::new().unwrap();
-        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
+        let mut value = row(200, 200, Some(usage()));
+        value.as_object_mut().unwrap().remove("servedModel");
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
+        assert_eq!(messages[0].cost, 7.0);
+    }
+
+    #[test]
+    fn missing_requested_selector_fails_closed() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        value.as_object_mut().unwrap().remove("requestedModel");
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+    }
+
+    #[test]
+    fn estimated_usage_is_not_authoritative() {
+        let home = TempDir::new().unwrap();
+        let mut estimated = usage();
+        estimated["estimated"] = json!(true);
+        write_ledger(home.path(), &[row(200, 200, Some(estimated))], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
+    }
+
+    #[test]
+    fn stream_aborted_attempt_is_not_authoritative() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        value["attempts"][0]["streamAborted"] = json!(true);
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+    }
+
+    #[test]
+    fn authoritative_service_tier_is_carried_to_repricing() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        value["attempts"][0]["tierOutcome"] = json!({
+            "responseServiceTier": "priority",
+            "responseTierAuthoritative": true
+        });
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+        assert_eq!(messages[0].service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn unauthoritative_tier_is_not_carried() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        value["attempts"][0]["tierOutcome"] = json!({
+            "responseServiceTier": "priority",
+            "responseTierAuthoritative": false
+        });
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+        assert_eq!(messages[0].service_tier, None);
+    }
+
+    #[test]
+    fn failed_failover_attempt_does_not_hide_unique_success() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
         value["attempts"] = json!([
             {
                 "ordinal": 1,
-                "provider": "openai",
-                "model": "gpt-6.1-sol",
-                "adapter": "openai-responses",
+                "provider": "fixture-provider-a",
+                "model": "failed-wire-model-fixture",
+                "adapter": "fixture-responses",
                 "status": 502,
                 "durationMs": 100,
                 "sendCount": 1,
@@ -573,11 +839,11 @@ mod tests {
             },
             {
                 "ordinal": 2,
-                "provider": "openai",
-                "model": "gpt-6-luna",
-                "adapter": "openai-responses",
+                "provider": PROVIDER,
+                "model": WIRE_MODEL,
+                "adapter": "fixture-responses",
                 "status": 200,
-                "durationMs": 8_400,
+                "durationMs": ROW_DURATION,
                 "sendCount": 1,
                 "recoveryKinds": [],
                 "usageStatus": "reported",
@@ -591,18 +857,112 @@ mod tests {
             attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
             1
         );
-        assert_eq!(messages[0].model_id, "gpt-6-luna");
+        assert_eq!(messages[0].model_id, SERVED_MODEL);
+    }
+
+    #[test]
+    fn two_eligible_attempts_cannot_claim_one_served_model() {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        let mut second = value["attempts"][0].clone();
+        second["ordinal"] = json!(2);
+        second["model"] = json!("another-wire-model-fixture");
+        value["attempts"].as_array_mut().unwrap().push(second);
+        write_ledger(home.path(), &[value], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
     }
 
     #[test]
     fn token_mismatch_does_not_attribute_even_when_time_matches() {
         let home = TempDir::new().unwrap();
         let mut wrong = usage();
-        wrong["outputTokens"] = json!(316);
-        wrong["totalTokens"] = json!(96951);
+        wrong["outputTokens"] = json!(26);
+        wrong["totalTokens"] = json!(526);
+        write_ledger(home.path(), &[row(200, 200, Some(wrong))], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
+    }
+
+    #[test]
+    fn conflicting_cache_counters_fail_closed() {
+        let home = TempDir::new().unwrap();
+        let mut conflicting = usage();
+        conflicting["cacheReadInputTokens"] = json!(399);
+        write_ledger(home.path(), &[row(200, 200, Some(conflicting))], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+    }
+
+    #[test]
+    fn no_duration_record_uses_its_response_time_as_end_anchor() {
+        let home = TempDir::new().unwrap();
+        write_ledger(home.path(), &[row(200, 200, Some(usage()))], false);
+        // An unconfirmed token_usage_record carries the record time and no
+        // duration: START + DURATION is the response's end. Matching on the
+        // request start would put this ROW_START_OFFSET + ROW_DURATION
+        // milliseconds away and fail.
+        let mut message = codex_message();
+        message.timestamp = START + DURATION;
+        message.duration_ms = None;
+        let mut messages = vec![message];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+        assert_eq!(messages[0].model_id, SERVED_MODEL);
+    }
+
+    #[test]
+    fn distant_matching_usage_does_not_attribute() {
+        let home = TempDir::new().unwrap();
+        let mut distant = row(200, 200, Some(usage()));
+        distant["timestamp"] = json!(START + 600_000);
+        write_ledger(home.path(), &[distant], false);
+        let mut messages = vec![codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert_eq!(messages[0].model_id, SELECTOR);
+    }
+
+    #[test]
+    fn one_ledger_request_cannot_attribute_two_codex_messages() {
+        let home = TempDir::new().unwrap();
+        write_ledger(home.path(), &[row(200, 200, Some(usage()))], false);
+        let mut messages = vec![codex_message(), codex_message()];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert!(messages.iter().all(|message| message.model_id == SELECTOR));
+        assert!(messages.iter().all(|message| message.cost == 7.0));
+    }
+
+    #[test]
+    fn multiple_candidate_requests_fail_closed_even_for_the_same_target() {
+        let home = TempDir::new().unwrap();
         write_ledger(
             home.path(),
-            &[row("gpt-6-luna", 200, 200, Some(wrong))],
+            &[row(200, 200, Some(usage())), row(200, 200, Some(usage()))],
             false,
         );
         let mut messages = vec![codex_message()];
@@ -615,13 +975,45 @@ mod tests {
     }
 
     #[test]
-    fn distant_matching_usage_does_not_attribute() {
+    fn distant_requests_claim_their_own_rows_after_sorting() {
         let home = TempDir::new().unwrap();
-        let mut distant = row("gpt-6-luna", 200, 200, Some(usage()));
-        distant["timestamp"] = json!(START + 600_000);
-        write_ledger(home.path(), &[distant], false);
-        let mut messages = vec![codex_message()];
+        let mut later = row_with_served(OTHER_SERVED_MODEL, 200, 200, Some(usage()));
+        later["timestamp"] = json!(START + 600_000);
+        write_ledger(home.path(), &[row(200, 200, Some(usage())), later], false);
+        let mut later_message = codex_message();
+        later_message.timestamp = START + 600_000 - ROW_START_OFFSET;
+        let mut messages = vec![later_message, codex_message()];
 
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            2
+        );
+        assert_eq!(messages[0].model_id, OTHER_SERVED_MODEL);
+        assert_eq!(messages[1].model_id, SERVED_MODEL);
+    }
+
+    #[test]
+    fn appended_rows_invalidate_the_cached_index_and_restore_ambiguity() {
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join(".opencodex");
+        fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("usage.jsonl");
+        fs::write(
+            &ledger,
+            serde_json::to_vec(&row(200, 200, Some(usage()))).unwrap(),
+        )
+        .unwrap();
+        let mut messages = vec![codex_message()];
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            1
+        );
+
+        let mut body = fs::read(&ledger).unwrap();
+        body.push(b'\n');
+        body.extend(serde_json::to_vec(&row(200, 200, Some(usage()))).unwrap());
+        fs::write(&ledger, body).unwrap();
+        let mut messages = vec![codex_message()];
         assert_eq!(
             attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
             0
@@ -651,8 +1043,7 @@ mod tests {
         let mut env = crate::paths::test_env::EnvGuard::capture(&["OPENCODEX_HOME"]);
         env.set("OPENCODEX_HOME", override_home.path());
 
-        let body =
-            serde_json::to_string(&row("gpt-6-luna", 200, 200, Some(usage()))).unwrap() + "\n";
+        let body = serde_json::to_string(&row(200, 200, Some(usage()))).unwrap() + "\n";
         fs::write(override_home.path().join("usage.jsonl"), body).unwrap();
 
         let mut messages = vec![codex_message()];
@@ -660,13 +1051,13 @@ mod tests {
             attribute_codex_messages(default_home.path().to_str().unwrap(), true, &mut messages),
             1
         );
-        assert_eq!(messages[0].model_id, "gpt-6-luna");
+        assert_eq!(messages[0].model_id, SERVED_MODEL);
     }
 
     #[test]
     fn combo_rows_without_protocol_are_ignored() {
         let home = TempDir::new().unwrap();
-        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
+        let mut value = row(200, 200, Some(usage()));
         value.as_object_mut().unwrap().remove("inboundProtocol");
         write_ledger(home.path(), &[value], false);
         let mut messages = vec![codex_message()];
@@ -679,108 +1070,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_attempt_usage_status_fails_closed() {
-        let home = TempDir::new().unwrap();
-        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
-        value["attempts"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("usageStatus");
-        write_ledger(home.path(), &[value], false);
-        let mut messages = vec![codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            0
-        );
-        assert_eq!(messages[0].model_id, SELECTOR);
-    }
-
-    #[test]
-    fn a_single_ledger_row_cannot_attribute_two_messages() {
-        let home = TempDir::new().unwrap();
-        write_ledger(
-            home.path(),
-            &[row("gpt-6-luna", 200, 200, Some(usage()))],
-            false,
-        );
-        let mut messages = vec![codex_message(), codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            0
-        );
-        assert!(messages.iter().all(|msg| msg.model_id == SELECTOR));
-    }
-
-    #[test]
-    fn duplicate_ledger_rows_fail_closed() {
-        let home = TempDir::new().unwrap();
-        let entry = row("gpt-6-luna", 200, 200, Some(usage()));
-        write_ledger(home.path(), &[entry.clone(), entry], false);
-        let mut messages = vec![codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            0
-        );
-    }
-
-    #[test]
-    fn distant_requests_claim_their_own_rows_after_sorting() {
-        let home = TempDir::new().unwrap();
-        let first = row("gpt-6-luna", 200, 200, Some(usage()));
-        let mut later = row("gpt-6.1-sol", 200, 200, Some(usage()));
-        later["timestamp"] = json!(START + 312_952);
-        let mut messages = vec![codex_message(), codex_message()];
-        messages[1].timestamp += 300_000;
-        write_ledger(home.path(), &[later, first], false);
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            2
-        );
-        assert_eq!(messages[0].model_id, "gpt-6-luna");
-        assert_eq!(messages[1].model_id, "gpt-6.1-sol");
-    }
-
-    #[test]
-    fn appended_rows_invalidate_cached_index_and_restore_ambiguity() {
-        let home = TempDir::new().unwrap();
-        let item = row("gpt-6-luna", 200, 200, Some(usage()));
-        write_ledger(home.path(), &[item.clone()], false);
-        let mut messages = vec![codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            1
-        );
-        write_ledger(home.path(), &[item.clone(), item], false);
-        let mut messages = vec![codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            0
-        );
-    }
-
-    #[test]
-    fn sorted_time_window_skips_unrelated_history() {
-        let home = TempDir::new().unwrap();
-        let mut rows = Vec::new();
-        for i in (1..=1000_i64).rev() {
-            let mut far = row("gpt-6.1-sol", 200, 200, Some(usage()));
-            far["timestamp"] = json!(START + i * 300_000);
-            rows.push(far);
-        }
-        rows.push(row("gpt-6-luna", 200, 200, Some(usage())));
-        write_ledger(home.path(), &rows, false);
-        let mut messages = vec![codex_message()];
-        assert_eq!(
-            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
-            1
-        );
-        assert_eq!(messages[0].model_id, "gpt-6-luna");
-    }
-
-    #[test]
     fn non_responses_combo_rows_are_ignored() {
         let home = TempDir::new().unwrap();
-        let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
+        let mut value = row(200, 200, Some(usage()));
         value["inboundProtocol"] = json!("messages");
         write_ledger(home.path(), &[value], false);
         let mut messages = vec![codex_message()];
