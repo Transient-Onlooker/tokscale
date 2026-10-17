@@ -1652,7 +1652,11 @@ fn write_jcode_session(base: &Path) {
 fn write_cursor_usage_cache(base: &Path) {
     let cache_dir = base.join(".config/tokscale/cursor-cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    fs::write(cache_dir.join("usage.json"), r#"{"usageEventsDisplay":[]}"#).unwrap();
+    fs::write(
+        cache_dir.join("usage.json"),
+        r#"{"_tokscale":{"version":1,"accountId":"active-account"},"usageEventsDisplay":[]}"#,
+    )
+    .unwrap();
 }
 
 fn write_cursor_credentials(base: &Path) {
@@ -3397,6 +3401,61 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
         !stderr.contains("Cursor sync failed") && !stderr.contains("Cursor sync warning"),
         "fresh Cursor cache should skip implicit graph sync; stderr: {stderr}"
     );
+}
+
+#[test]
+fn test_cursor_logout_all_purge_removes_cache_without_credentials() {
+    let tmp = create_empty_fixture_dir();
+    let current = tmp.path().join(".config/tokscale/cursor-cache");
+    let legacy = tmp.path().join(".tokscale/cursor-cache");
+    fs::create_dir_all(current.join("archive/old")).unwrap();
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(current.join("archive/old/usage.json"), b"archived usage").unwrap();
+    fs::write(legacy.join("usage.csv"), b"legacy usage").unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .args(["cursor", "logout", "--all", "--purge-cache"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!current.exists());
+    assert!(!legacy.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Purged all Cursor cache data"));
+}
+
+#[test]
+fn test_graph_preserves_unowned_cursor_cache_when_refetch_fails() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_credentials(tmp.path());
+    let cache_dir = tmp.path().join(".config/tokscale/cursor-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let legacy = r#"{"usageEventsDisplay":[]}"#;
+    fs::write(cache_dir.join("usage.json"), legacy).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preserved 1 cache file(s)"), "{stderr}");
+    assert!(stderr.contains("Cursor sync failed"), "{stderr}");
+    assert!(!cache_dir.join("usage.json").exists());
+    let archives: Vec<_> = fs::read_dir(cache_dir.join("archive")).unwrap().collect();
+    assert_eq!(archives.len(), 1);
+    let original = archives[0].as_ref().unwrap().path().join("usage.json");
+    assert_eq!(fs::read_to_string(original).unwrap(), legacy);
 }
 
 #[test]
@@ -7293,4 +7352,226 @@ fn test_codex_compressed_session_reports_usage() {
         assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
         assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
     }
+}
+
+#[test]
+fn test_codex_compressed_session_respects_max_decoded_bytes_env() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    let compressed_file = sessions.join("fixture.jsonl.zst");
+    fs::write(
+        &compressed_file,
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    let capped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        capped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&capped_output.stderr)
+    );
+    let capped_stderr = String::from_utf8_lossy(&capped_output.stderr);
+    assert!(
+        capped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {capped_stderr}"
+    );
+    assert!(
+        capped_stderr.contains("decoded size limit exceeded: more than 64 bytes"),
+        "stderr: {capped_stderr}"
+    );
+    let capped_json: serde_json::Value = serde_json::from_slice(&capped_output.stdout).unwrap();
+    assert_eq!(capped_json["totalMessages"].as_i64().unwrap(), 0);
+
+    // Raising the decoded limit recovers the previously skipped archive because
+    // failed archive parses are never cached.
+    let raised_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "4096")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        raised_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&raised_output.stderr)
+    );
+    let raised_stderr = String::from_utf8_lossy(&raised_output.stderr);
+    assert!(
+        !raised_stderr.contains("unreadable compressed Codex rollout"),
+        "stderr: {raised_stderr}"
+    );
+    let raised_json: serde_json::Value = serde_json::from_slice(&raised_output.stdout).unwrap();
+    assert_eq!(raised_json["totalInput"].as_i64().unwrap(), 110);
+    assert_eq!(raised_json["totalCacheRead"].as_i64().unwrap(), 30);
+    assert_eq!(raised_json["totalOutput"].as_i64().unwrap(), 10);
+    assert_eq!(raised_json["totalMessages"].as_i64().unwrap(), 1);
+    assert_eq!(raised_json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+
+    // Lowering the limit on the populated cache must invalidate the entry and reparse,
+    // skipping the archive rather than serving the cached entry.
+    let recapped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        recapped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&recapped_output.stderr)
+    );
+    let recapped_stderr = String::from_utf8_lossy(&recapped_output.stderr);
+    assert!(
+        recapped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {recapped_stderr}"
+    );
+    let recapped_json: serde_json::Value = serde_json::from_slice(&recapped_output.stdout).unwrap();
+    assert_eq!(recapped_json["totalMessages"].as_i64().unwrap(), 0);
+}
+
+#[test]
+fn test_codex_archive_limit_cache_identity_uses_exact_ceiling() {
+    use std::io::Write as _;
+
+    // These two accepted ceilings collide under the former 32-bit FNV cache
+    // version. Keep the decoded fixture between them so a warm hit admitted by
+    // the higher ceiling must be rejected after switching to the lower one.
+    const LOWER_LIMIT: u64 = 61_378_655;
+    const HIGHER_LIMIT: u64 = 71_067_507;
+    const PADDING_RECORDS: usize = 62;
+
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let compressed_file = sessions.join("collision-fixture.jsonl.zst");
+    let turn_context =
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+    let padding_record = format!(
+        r#"{{"timestamp":"2026-10-01T00:00:01Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+        "x".repeat(1_000_000)
+    );
+    let usage = r#"{"timestamp":"2026-10-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#;
+    let decoded_size =
+        turn_context.len() + 1 + PADDING_RECORDS * (padding_record.len() + 1) + usage.len() + 1;
+    assert!((decoded_size as u64) > LOWER_LIMIT);
+    assert!((decoded_size as u64) < HIGHER_LIMIT);
+
+    let mut encoder =
+        zstd::stream::write::Encoder::new(fs::File::create(&compressed_file).unwrap(), 0).unwrap();
+    writeln!(encoder, "{turn_context}").unwrap();
+    for _ in 0..PADDING_RECORDS {
+        writeln!(encoder, "{padding_record}").unwrap();
+    }
+    writeln!(encoder, "{usage}").unwrap();
+    encoder.finish().unwrap();
+
+    let admitted = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", HIGHER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        admitted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    let admitted_json: serde_json::Value = serde_json::from_slice(&admitted.stdout).unwrap();
+    assert_eq!(admitted_json["totalMessages"].as_i64().unwrap(), 1);
+
+    let rejected = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", LOWER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        rejected.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejected_stderr.contains("1 exceeded the 61378655-byte decoded-size limit"),
+        "stderr: {rejected_stderr}"
+    );
+    let rejected_json: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected_json["totalMessages"].as_i64().unwrap(), 0);
+}
+
+#[test]
+fn test_codex_invalid_max_decoded_bytes_env_warns_and_uses_default() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    fs::write(
+        sessions.join("fixture.jsonl.zst"),
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    // "512MiB" looks like a limit a user would write, but it does not parse, so
+    // the ceiling silently stays at the 1 GiB default.
+    let output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "512MiB")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("TOKSCALE_CODEX_MAX_DECODED_BYTES=\"512MiB\" is not a whole number of bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("using the default 1073741824-byte decoded-size limit"),
+        "stderr: {stderr}"
+    );
+    // The limit is read once per scanned archive and again per cache-identity
+    // check, so a per-call warning would repeat. `contains` alone passes either
+    // way, which is what makes the count the assertion that matters.
+    assert_eq!(
+        stderr.matches("TOKSCALE_CODEX_MAX_DECODED_BYTES=").count(),
+        1,
+        "the invalid-setting warning must be emitted once per process; stderr: {stderr}"
+    );
+    // The archive is well under the default, so the invalid value must not cost
+    // the user their usage.
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+    assert_eq!(json["totalInput"].as_i64().unwrap(), 110);
+
+    // A valid value stays silent.
+    let valid = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "4096")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(valid.status.success());
+    let valid_stderr = String::from_utf8_lossy(&valid.stderr);
+    assert!(
+        !valid_stderr.contains("is not a whole number of bytes"),
+        "stderr: {valid_stderr}"
+    );
 }

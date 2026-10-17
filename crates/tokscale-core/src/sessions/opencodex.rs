@@ -88,7 +88,10 @@ impl AttributionIndex {
             if row.inbound_protocol.as_deref() != Some("responses") {
                 continue;
             }
-            if !row.status.is_some_and(|status| (200..300).contains(&status)) {
+            if !row
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+            {
                 continue;
             }
 
@@ -432,7 +435,11 @@ mod tests {
     #[test]
     fn attributes_matching_combo_attempt_and_clears_virtual_cost() {
         let home = TempDir::new().unwrap();
-        write_ledger(home.path(), &[row("gpt-6-luna", 200, 200, Some(usage()))], false);
+        write_ledger(
+            home.path(),
+            &[row("gpt-6-luna", 200, 200, Some(usage()))],
+            false,
+        );
         let mut messages = vec![codex_message()];
 
         assert_eq!(
@@ -541,7 +548,11 @@ mod tests {
         let mut wrong = usage();
         wrong["outputTokens"] = json!(316);
         wrong["totalTokens"] = json!(96951);
-        write_ledger(home.path(), &[row("gpt-6-luna", 200, 200, Some(wrong))], false);
+        write_ledger(
+            home.path(),
+            &[row("gpt-6-luna", 200, 200, Some(wrong))],
+            false,
+        );
         let mut messages = vec![codex_message()];
 
         assert_eq!(
@@ -588,8 +599,8 @@ mod tests {
         let mut env = crate::paths::test_env::EnvGuard::capture(&["OPENCODEX_HOME"]);
         env.set("OPENCODEX_HOME", override_home.path());
 
-        let body = serde_json::to_string(&row("gpt-6-luna", 200, 200, Some(usage()))).unwrap()
-            + "\n";
+        let body =
+            serde_json::to_string(&row("gpt-6-luna", 200, 200, Some(usage()))).unwrap() + "\n";
         fs::write(override_home.path().join("usage.jsonl"), body).unwrap();
 
         let mut messages = vec![codex_message()];
@@ -604,10 +615,7 @@ mod tests {
     fn combo_rows_without_protocol_are_ignored() {
         let home = TempDir::new().unwrap();
         let mut value = row("gpt-6-luna", 200, 200, Some(usage()));
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("inboundProtocol");
+        value.as_object_mut().unwrap().remove("inboundProtocol");
         write_ledger(home.path(), &[value], false);
         let mut messages = vec![codex_message()];
 
