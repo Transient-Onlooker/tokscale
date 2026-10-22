@@ -1034,6 +1034,22 @@ mod tests {
     }
 
     #[test]
+    fn late_usage_does_not_claim_a_row_shared_by_two_codex_messages() {
+        let home = TempDir::new().unwrap();
+        write_ledger(home.path(), &[row(200, 200, Some(usage()))], false);
+        let first = codex_message();
+        let mut second = codex_message();
+        second.timestamp += 8_000;
+        let mut messages = vec![first, second];
+
+        assert_eq!(
+            attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages),
+            0
+        );
+        assert!(messages.iter().all(|message| message.model_id == SELECTOR));
+    }
+
+    #[test]
     fn multiple_candidate_requests_fail_closed_even_for_the_same_target() {
         let home = TempDir::new().unwrap();
         write_ledger(
