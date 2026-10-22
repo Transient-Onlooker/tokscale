@@ -348,18 +348,17 @@ fn timing_matches(message: &UnifiedMessage, row: &IndexedRow) -> bool {
     }
 
     let row_end = row.timestamp.saturating_add(row.duration_ms);
-    let message_end = if let Some(duration_ms) =
-        message.duration_ms.filter(|duration| *duration >= 0)
-    {
-        if message.timestamp.abs_diff(row.timestamp) > MAX_START_SKEW_MS {
-            return false;
-        }
-        message.timestamp.saturating_add(duration_ms)
-    } else {
-        // An unconfirmed `token_usage_record` is timestamped when the response
-        // lands, so its time anchors on the request's end, not its start.
-        message.timestamp
-    };
+    let message_end =
+        if let Some(duration_ms) = message.duration_ms.filter(|duration| *duration >= 0) {
+            if message.timestamp.abs_diff(row.timestamp) > MAX_START_SKEW_MS {
+                return false;
+            }
+            message.timestamp.saturating_add(duration_ms)
+        } else {
+            // An unconfirmed `token_usage_record` is timestamped when the response
+            // lands, so its time anchors on the request's end, not its start.
+            message.timestamp
+        };
     (-(MAX_END_SKEW_MS as i64)..=MAX_LATE_END_SKEW_MS)
         .contains(&message_end.saturating_sub(row_end))
 }
@@ -974,7 +973,11 @@ mod tests {
             );
             assert_eq!(
                 messages[0].model_id,
-                if expected_count == 1 { SERVED_MODEL } else { SELECTOR }
+                if expected_count == 1 {
+                    SERVED_MODEL
+                } else {
+                    SELECTOR
+                }
             );
         }
     }
@@ -984,7 +987,11 @@ mod tests {
         let home = TempDir::new().unwrap();
         let mut competing = row_with_served(OTHER_SERVED_MODEL, 200, 200, Some(usage()));
         competing["timestamp"] = json!(START + ROW_START_OFFSET + 10_000);
-        write_ledger(home.path(), &[row(200, 200, Some(usage())), competing], false);
+        write_ledger(
+            home.path(),
+            &[row(200, 200, Some(usage())), competing],
+            false,
+        );
 
         let mut message = codex_message();
         message.duration_ms = Some(DURATION + 25_000);
